@@ -1,0 +1,168 @@
+# HGhub 安卓 APK 一键构建：只出 arm64-v8a（三星等 64 位 ARM 手机）
+# 放到 fork 仓库的 .github/workflows/ 目录下，然后在 Actions 页手动触发。
+# 基于上游 .github/workflows/release.yml 的 android job 裁剪：
+#   - 只编 aarch64 一个 ABI，省时且包更小
+#   - 零配置：自动生成临时自签名证书，无需任何 Secrets 即可出可安装的 APK
+#   - 产物同时进 Artifacts 和 Releases（手机浏览器可直接下载安装）
+
+name: Build HGhub arm64-v8a APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "同时发布到 Releases（方便手机直接下载）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CI: "true"
+
+jobs:
+  build:
+    name: arm64-v8a APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ubuntu runner 自带 Android SDK；跳过 setup-android 的 license 交互
+      - name: 准备 Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      # 三个 Android target 都装上（只下载 std，成本极低），避免 Gradle 侧因缺 target 报错；
+      # 实际 Rust 编译只跑 aarch64 这一个。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      # 不用 --split-per-abi：只编 aarch64 时产物是单个 universal APK，
+      # 里面仅含 arm64-v8a 的 .so，三星可装，且不会出现多个 ABI 包挑错的情况。
+      - name: 编译 arm64-v8a APK
+        run: pnpm tauri android build --apk --target aarch64
+
+      # 可选：配置 4 个 Secrets 即可固定签名，避免升级时签名不一致必须卸载重装
+      #   ANDROID_KEYSTORE_BASE64  = base64 -w0 your.keystore
+      #   ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_PASSWORD / ANDROID_KEY_ALIAS
+      - name: 准备签名证书
+        shell: bash
+        env:
+          IN_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          IN_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          IN_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          IN_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/hghub.keystore"
+          if [ -n "${IN_KEYSTORE:-}" ]; then
+            echo "$IN_KEYSTORE" | base64 -d > "$KS"
+            {
+              echo "KS_ALIAS=${IN_ALIAS:-hghub}"
+              echo "KS_STORE_PASS=${IN_STORE_PASS:-}"
+              echo "KS_KEY_PASS=${IN_KEY_PASS:-${IN_STORE_PASS:-}}"
+            } >> "$GITHUB_ENV"
+            echo "SIGN_MODE=fixed" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -keystore "$KS" -alias hghub \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass hghub123 -keypass hghub123 \
+              -dname "CN=HGhub Personal, OU=Personal, O=Personal, L=NA, ST=NA, C=CN"
+            {
+              echo "KS_ALIAS=hghub"
+              echo "KS_STORE_PASS=hghub123"
+              echo "KS_KEY_PASS=hghub123"
+            } >> "$GITHUB_ENV"
+            echo "SIGN_MODE=temporary" >> "$GITHUB_ENV"
+            echo "::warning::使用临时证书：每次构建签名不同，覆盖安装会失败，需先卸载旧版。配置 4 个 ANDROID_KEY* Secrets 可固定签名。"
+          fi
+
+      - name: 对齐并签名 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          KS="$RUNNER_TEMP/hghub.keystore"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          ZA="$ANDROID_SDK_ROOT/build-tools/$BT/zipalign"
+          AS="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          OUT="artifacts/HGhub_arm64-v8a.apk"
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk"
+          mapfile -t ALL < <(find "$APK_DIR" -type f -name '*release*.apk' | sort)
+          if [ "${#ALL[@]}" -lt 1 ]; then
+            echo "::error::未找到 release APK，实际产物如下："
+            find "$APK_DIR" -type f || true
+            exit 1
+          fi
+          # 优先取 arm64-v8a 分包；没有分包（universal）时取唯一的 release 包
+          SRC=""
+          for f in "${ALL[@]}"; do
+            case "$f" in *arm64-v8a*|*aarch64*) SRC="$f"; break;; esac
+          done
+          [ -n "$SRC" ] || SRC="${ALL[0]}"
+          echo "签名源文件: $SRC （共发现 ${#ALL[@]} 个 release APK）"
+          ALIGNED="$RUNNER_TEMP/aligned.apk"
+          "$ZA" -f -p 4 "$SRC" "$ALIGNED"
+          "$AS" sign \
+            --ks "$KS" --ks-key-alias "$KS_ALIAS" \
+            --ks-pass "pass:$KS_STORE_PASS" --key-pass "pass:$KS_KEY_PASS" \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --v4-signing-enabled false \
+            --out "$OUT" "$ALIGNED"
+          echo "签名方式: $SIGN_MODE"
+          "$AS" verify --verbose "$OUT" | head -12
+          rm -f "$KS" "$ALIGNED"
+          sha256sum "$OUT"
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-arm64-v8a
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布到 Releases
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="android-arm64-${{ github.run_number }}"
+          gh release create "$TAG" artifacts/*.apk \
+            --target "${{ github.sha }}" \
+            --title "HGhub arm64-v8a · build ${{ github.run_number }}" \
+            --notes "适用于三星等 64 位 ARM 手机的自编译包（$SIGN_MODE 签名，minSdk 24）。自签名应用，安装时需允许「安装未知应用」。仅限个人非商业使用。"
